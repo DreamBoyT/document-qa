@@ -1,53 +1,237 @@
+# Import necessary libraries
 import streamlit as st
-from openai import OpenAI
+from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
+import tempfile
+import time
+import concurrent.futures
+from langchain import LLMChain, PromptTemplate
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.document_loaders import PyPDFLoader
+from langchain.docstore.document import Document
+from langchain.vectorstores import FAISS
+from langchain.chains.question_answering import load_qa_chain
+from PyPDF2 import PdfReader
+from io import BytesIO
+from docx import Document as DocxDocument
 
-# Show title and description.
-st.title("📄 Document question answering")
-st.write(
-    "Upload a document below and ask a question about it – GPT will answer! "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
+# Azure OpenAI API details
+azure_api_key = 'c09f91126e51468d88f57cb83a63ee36'
+azure_endpoint = 'https://chat-gpt-a1.openai.azure.com/'
+azure_api_version = '2024-02-01'
+azure_chat_endpoint = 'https://danielingitaraj.openai.azure.com/'
+openai_api_key = 'a5c4e09a50dd4e13a69e7ef19d07b48c'
+
+# Initialize Azure OpenAI Embeddings
+embed_model = AzureOpenAIEmbeddings(
+    model="text-embedding-3-large",
+    deployment="text-embedding-3-large",
+    api_version="2023-12-01-preview",
+    azure_endpoint=azure_endpoint,
+    openai_api_key=azure_api_key,
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# Initialize Azure OpenAI LLM
+llm = AzureChatOpenAI(
+    openai_api_key=openai_api_key,
+    api_version=azure_api_version,
+    azure_endpoint=azure_chat_endpoint,
+    model="gpt-4",
+    base_url=None,
+    azure_deployment="GPT4",
+    temperature=0.5,  # Adjusted temperature for improved summaries
+)
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# Text Splitter
+text_splitter = CharacterTextSplitter(
+    separator="\n",
+    chunk_size=1000,
+    chunk_overlap=150,
+    length_function=len,
+)
 
-    # Let the user upload a file via `st.file_uploader`.
-    uploaded_file = st.file_uploader(
-        "Upload a document (.txt or .md)", type=("txt", "md")
-    )
+# Streamlit user interface
+st.title("Document Intelligent Application")
+pdf_file = st.file_uploader("Choose a PDF file", type="pdf")
 
-    # Ask the user for a question via `st.text_area`.
-    question = st.text_area(
-        "Now ask a question about the document!",
-        placeholder="Can you give me a short summary?",
-        disabled=not uploaded_file,
-    )
+def extract_text_from_pdf(file):
+    """
+    Extracts text from each page of a PDF document.
 
-    if uploaded_file and question:
+    Parameters:
+        file (str): The path to the PDF file.
 
-        # Process the uploaded file and question.
-        document = uploaded_file.read().decode()
-        messages = [
-            {
-                "role": "user",
-                "content": f"Here's a document: {document} \n\n---\n\n {question}",
-            }
-        ]
+    Returns:
+        list: A list of tuples where each tuple contains the page number and the text extracted from that page.
+    """
+    reader = PdfReader(file)
+    texts = [(i + 1, page.extract_text()) for i, page in enumerate(reader.pages)]
+    return texts
 
-        # Generate an answer using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            stream=True,
+def create_prompt(page_numbers, combined_text):
+    """
+    Creates a prompt for summarizing a group of pages.
+
+    Parameters:
+        page_numbers (list): The list of page numbers.
+        combined_text (str): The combined text of the pages.
+
+    Returns:
+        str: A formatted prompt string.
+    """
+    # Escape braces
+    combined_text = combined_text.replace("{", "{{").replace("}", "}}")
+    return f"""Extract the main points and summarize the following text from pages {page_numbers} in a clear and concise manner:
+    
+    {combined_text}
+    
+    Provide 4 key highlights that summarize the main content of these pages.
+    """
+
+def summarize_pages(llm, page_numbers, combined_text):
+    """
+    Summarizes the text of a group of pages.
+
+    Parameters:
+        llm (LLM): An instance of the Large Language Model (LLM) for generating summaries.
+        page_numbers (list): The list of page numbers.
+        combined_text (str): The combined text of the pages.
+
+    Returns:
+        str: The summary of the group of pages.
+    """
+    prompt = create_prompt(page_numbers, combined_text)
+    prompt_template = PromptTemplate.from_template(prompt)
+    chain = LLMChain(llm=llm, prompt=prompt_template)
+    response = chain.run({
+        "combined_text": combined_text
+    })
+    start_page = page_numbers[0]
+    end_page = page_numbers[-1]
+    return f"**Pages {start_page}-{end_page}:**\n\n{response.strip()}\n"
+
+def group_texts(texts, group_size=3):
+    """
+    Groups the extracted texts into chunks of specified size.
+
+    Parameters:
+        texts (list): A list of tuples where each tuple contains the page number and the text extracted from that page.
+        group_size (int): The number of pages to group together.
+
+    Returns:
+        list: A list of tuples where each tuple contains the list of page numbers and the combined text of the grouped pages.
+    """
+    grouped_texts = []
+    for i in range(0, len(texts), group_size):
+        group = texts[i:i + group_size]
+        page_numbers = [num for num, _ in group]
+        combined_text = "\n".join([text for _, text in group])
+        grouped_texts.append((page_numbers, combined_text))
+    return grouped_texts
+
+def extract_summaries_from_pdf(llm, file):
+    """
+    Extracts summaries from each group of pages in a PDF document using the LLM.
+
+    Parameters:
+        llm (LLM): An instance of the Large Language Model (LLM) for generating summaries.
+        file (str): The path to the PDF file for extracting summaries.
+
+    Returns:
+        str: A response generated by the language model with summaries for each group of pages.
+    """
+    texts = extract_text_from_pdf(file)
+    grouped_texts = group_texts(texts)
+    
+    # Process grouped pages in parallel and maintain order
+    summaries = [None] * len(grouped_texts)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {executor.submit(summarize_pages, llm, page_numbers, combined_text): idx for idx, (page_numbers, combined_text) in enumerate(grouped_texts)}
+        for future in concurrent.futures.as_completed(futures):
+            idx = futures[future]
+            try:
+                summaries[idx] = future.result()
+            except Exception as e:
+                start_page = grouped_texts[idx][0][0]
+                end_page = grouped_texts[idx][0][-1]
+                summaries[idx] = f"**Pages {start_page}-{end_page}:**\n\nError summarizing pages {start_page}-{end_page}: {e}\n"
+    
+    return "\n".join(summaries)
+
+def generate_word_file(summaries):
+    """
+    Generates a Word file from the summaries.
+
+    Parameters:
+        summaries (str): The summaries to be written to the Word file.
+
+    Returns:
+        BytesIO: The Word file in a BytesIO stream.
+    """
+    doc = DocxDocument()
+    doc.add_heading('Document Summary', 0)
+
+    for summary in summaries.split("\n\n"):
+        doc.add_paragraph(summary)
+
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+if pdf_file is not None:
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        tmp_file.write(pdf_file.read())
+        pdf_path = tmp_file.name
+        loader = PyPDFLoader(pdf_path)
+        pages = loader.load_and_split()
+
+    page_selection = st.radio("Page selection", ["Overall Summary", "Question"])
+
+    if page_selection == "Overall Summary":
+        combined_content = ''.join([p.page_content for p in pages])
+        texts = text_splitter.split_text(combined_content)
+        
+        # Summarize each group of pages
+        summaries = extract_summaries_from_pdf(llm, pdf_path)
+        st.subheader("Page-wise Summaries")
+        st.write(summaries)
+        
+        # Generate and provide download link for Word file
+        word_file = generate_word_file(summaries)
+        st.download_button(
+            label="Download Summary as Word",
+            data=word_file,
+            file_name="summary.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
+        
+    elif page_selection == "Question":
+        question = st.text_input("Enter your question", value="Enter your question here...")
+        combined_content = ''.join([p.page_content for p in pages])
+        texts = text_splitter.split_text(combined_content)
+        document_search = FAISS.from_texts(texts, embed_model)
+        
+        # Perform similarity search to retrieve relevant documents
+        docs = document_search.similarity_search(question)
+        
+        # Initialize your LangChain Q&A pipeline
+        chain = load_qa_chain(llm, chain_type="stuff")
+        
+        # Run the Q&A pipeline with enhancements (sentence window, reranker, step back prompting)
+        summaries = chain.run(
+            input_documents=docs,
+            question=question,
+            operations=[
+                {"name": "sentence_window", "params": {"window_size": 3}},
+                {"name": "reranker", "params": {"top_n": 5}},
+                {"name": "step_back_prompting", "params": {"prompt_length": 50}}
+            ]
+        )
+        
+        # Display the resulting summaries
+        st.subheader("Question Answering Result")
+        st.write(summaries)
 
-        # Stream the response to the app using `st.write_stream`.
-        st.write_stream(stream)
+else:
+    time.sleep(35)
+    st.warning("No PDF file uploaded")
