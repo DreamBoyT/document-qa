@@ -1,4 +1,3 @@
-# Import necessary libraries
 import streamlit as st
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 import tempfile
@@ -7,12 +6,12 @@ import concurrent.futures
 from langchain import LLMChain, PromptTemplate
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.document_loaders import PyPDFLoader
-from langchain.docstore.document import Document
 from langchain.vectorstores import FAISS
 from langchain.chains.question_answering import load_qa_chain
 from PyPDF2 import PdfReader
 from io import BytesIO
 from docx import Document as DocxDocument
+import base64
 
 # Azure OpenAI API details
 azure_api_key = 'c09f91126e51468d88f57cb83a63ee36'
@@ -44,14 +43,14 @@ llm = AzureChatOpenAI(
 # Text Splitter
 text_splitter = CharacterTextSplitter(
     separator="\n",
-    chunk_size=1000,
-    chunk_overlap=150,
+    chunk_size=1500,
+    chunk_overlap=200,
     length_function=len,
 )
 
 # Streamlit user interface
 st.title("Document Intelligent Application")
-pdf_file = st.file_uploader("Choose a PDF file", type="pdf")
+pdf_file = st.sidebar.file_uploader("Choose a PDF file", type="pdf")
 
 def extract_text_from_pdf(file):
     """
@@ -84,7 +83,7 @@ def create_prompt(page_numbers, combined_text):
     
     {combined_text}
     
-    Provide 4 key highlights that summarize the main content of these pages.
+    Provide 4 key highlights that summarize the main content of these pages using letters ((a), (b), (c), (d)).
     """
 
 def summarize_pages(llm, page_numbers, combined_text):
@@ -178,6 +177,9 @@ def generate_word_file(summaries):
     buffer.seek(0)
     return buffer
 
+overall_summary = ""
+question_summaries = ""
+
 if pdf_file is not None:
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
         tmp_file.write(pdf_file.read())
@@ -185,28 +187,82 @@ if pdf_file is not None:
         loader = PyPDFLoader(pdf_path)
         pages = loader.load_and_split()
 
-    page_selection = st.radio("Page selection", ["Overall Summary", "Question"])
+    overall_summary_checkbox = st.sidebar.checkbox("Generate Overall Summary")
 
-    if page_selection == "Overall Summary":
+    if overall_summary_checkbox:
         combined_content = ''.join([p.page_content for p in pages])
         texts = text_splitter.split_text(combined_content)
         
         # Summarize each group of pages
-        summaries = extract_summaries_from_pdf(llm, pdf_path)
-        st.subheader("Page-wise Summaries")
-        st.write(summaries)
-        
-        # Generate and provide download link for Word file
-        word_file = generate_word_file(summaries)
-        st.download_button(
-            label="Download Summary as Word",
-            data=word_file,
-            file_name="summary.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-        
-    elif page_selection == "Question":
-        question = st.text_input("Enter your question", value="Enter your question here...")
+        overall_summary = extract_summaries_from_pdf(llm, pdf_path)
+
+    if overall_summary:
+        with st.sidebar:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.subheader(pdf_file.name)
+                st.write(overall_summary)
+            with col2:
+                # Generate and provide download link for Word file with tooltip
+                word_file = generate_word_file(overall_summary)
+                file_name = pdf_file.name.rsplit('.', 1)[0] + "_summary.docx"
+                st.markdown(
+                    f"""
+                    <style>
+                    .download-button {{
+                        position: relative;
+                        display: inline-block;
+                        margin-top: 10px;
+                    }}
+                    .download-button button {{
+                        background-color: #1a1c23;
+                        color: white;
+                        border: 2px solid #262730;
+                        border-radius: 8px;
+                        padding: 10px 20px;
+                        cursor: pointer;
+                        font-size: 14px;
+                        transition: background-color 0.3s, border-color 0.3s;
+                    }}
+                    .download-button button:hover {{
+                        border-color: #1a1c23;
+                    }}
+                    .tooltip {{
+                        visibility: hidden;
+                        width: 160px;
+                        background-color: #555;
+                        color: #fff;
+                        text-align: center;
+                        border-radius: 5px;
+                        padding: 5px 0;
+                        position: absolute;
+                        z-index: 1;
+                        bottom: 125%; /* Position above the button */
+                        left: 50%;
+                        margin-left: -80px;
+                        opacity: 0;
+                        transition: opacity 0.3s;
+                    }}
+                    .download-button:hover .tooltip {{
+                        visibility: visible;
+                        opacity: 1;
+                    }}
+                    </style>
+                    <div class="download-button">
+                        <a href="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{base64.b64encode(word_file.read()).decode()}" download="{file_name}">
+                            <button>Download</button>
+                            <span class="tooltip" style="background-color: #1a1c23;">Download the summary in Word format</span>
+                        </a>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+    # Question input at the bottom
+    question = st.text_input("Chat with your document", value="Enter your question here...")
+    submit_button = st.button("Ask")
+
+    if submit_button and question:
         combined_content = ''.join([p.page_content for p in pages])
         texts = text_splitter.split_text(combined_content)
         document_search = FAISS.from_texts(texts, embed_model)
@@ -229,9 +285,8 @@ if pdf_file is not None:
         )
         
         # Display the resulting summaries
-        st.subheader("Question Answering Result")
+        st.subheader("Response")
         st.write(summaries)
-
 else:
     time.sleep(35)
     st.warning("No PDF file uploaded")
